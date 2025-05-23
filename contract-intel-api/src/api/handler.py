@@ -186,117 +186,48 @@ def process_contract_request(event, context):
 
     # --- 1. Initiate OCR (Textract) ---
     logger.info(f"Job {job_id}: Initiating OCR for {s3_uri}")
-    # The ocr.start_textract_job function is expected to send an SQS message with its own job_id (textract_job_id)
-    # and the original s3_uri. Our main job_id here is for the overall API request.
-    # We will store this main job_id along with the textract_job_id if needed later for correlation.
-    textract_job_id = ocr.start_textract_job(
+    # The ocr.start_textract_job function is expected to configure NotificationChannel
+    # to use the central SNS topic (TEXTRACT_SNS_TOPIC_ARN).
+    # It also needs the TEXTRACT_IAM_ROLE_ARN that Textract will assume to publish to SNS.
+    # The `job_id` (our API job_id) should be passed as `JobTag` to Textract
+    # so the completion handler can correlate Textract's job with our API job.
+    textract_call_response = ocr.start_textract_job( # Assuming this function is updated or directly use boto3 here
         s3_bucket=s3_bucket,
         s3_key=s3_key,
         region_name=AWS_REGION,
-        # These will be picked up from env vars by the ocr module if not passed,
-        # but passing them explicitly for clarity if desired:
-        sqs_queue_url=TEXTRACT_SQS_QUEUE_URL,
-        sns_topic_arn=TEXTRACT_SNS_TOPIC_ARN,
-        iam_role_arn=TEXTRACT_IAM_ROLE_ARN,
+        sns_topic_arn=TEXTRACT_SNS_TOPIC_ARN, # Central SNS topic for Textract notifications
+        iam_role_arn=TEXTRACT_IAM_ROLE_ARN,   # Role Textract assumes to publish to SNS
+        client_request_token=job_id, # Use API job_id as client request token for idempotency
+        job_tag=job_id # Pass API job_id as JobTag for Textract to include in SNS message
     )
+
+    textract_job_id = textract_call_response if isinstance(textract_call_response, str) else (textract_call_response.get("JobId") if isinstance(textract_call_response, dict) else None)
+
 
     if not textract_job_id:
         logger.error(f"Job {job_id}: Failed to start Textract job for {s3_uri}.")
-        response_payload = {
-            "job_id": job_id,
-            "s3_uri": s3_uri,
-            "status": "FAILED",
-            "error": "Failed to initiate document processing (OCR).",
-        }
-        if callback_url:
-            send_callback(callback_url, job_id, "FAILED", error_message="Failed to initiate document processing (OCR).")
-        return {"statusCode": 500, "body": json.dumps(response_payload)}
+        # Update DynamoDB to FAILED
+        error_message_ocr_start = "Failed to initiate document processing (OCR)."
+        update_job_status_in_db(job_id, "FAILED", {"error_message": error_message_ocr_start})
+        # No callback here as per original logic, but could be added
+        return {"statusCode": 500, "body": json.dumps({"job_id": job_id, "status": "FAILED", "error": error_message_ocr_start})}
 
-    logger.info(f"Job {job_id}: Textract job initiated with textract_job_id: {textract_job_id}. "
-                f"SQS message sent by Textract wrapper to queue: {TEXTRACT_SQS_QUEUE_URL}")
+    logger.info(f"Job {job_id}: Textract job initiated with Textract JobId: {textract_job_id}. ")
 
-    # --- Orchestration Note ---
-    # At this point, the Textract job has started. The actual text extraction is asynchronous.
-    # A separate Lambda function (e.g., triggered by SQS message from Textract completion via SNS)
-    # would handle:
-    #   1. Retrieving Textract results (clean text).
-    #   2. Invoking SageMaker endpoint with the clean text.
-    #   3. Storing the final combined result to S3.
-    #   4. Sending a final callback.
-
-    # For THIS SUBTASK, we are simulating the next steps as if Textract was synchronous
-    # to demonstrate SageMaker invocation and result storage.
-    # In a real-world scenario, this handler would likely return "IN_PROGRESS" now.
-
-    # --- SIMULATION: Assume Textract is complete and text is available ---
-    # This is a placeholder. In a real system, this text would come from Textract output
-    # processed by another Lambda.
-    logger.warning(f"Job {job_id}: SIMULATING Textract completion and SageMaker invocation. "
-                   f"This part would typically be in a separate Lambda triggered by Textract SQS message.")
-    simulated_extracted_text = f"This is simulated extracted text from {s3_key} for document type {document_type}."
-
-    # --- 2. Invoke SageMaker Endpoint (Simulated Path) ---
-    if not SAGEMAKER_ENDPOINT_NAME: # Check here as it's specific to this simulated path
-        logger.error(f"Job {job_id}: SAGEMAKER_ENDPOINT_NAME not configured for simulated SageMaker call.")
-        # Not failing the whole job here as the Textract part was submitted.
-        # The "real" Textract completion handler would face this.
-        # For now, we'll just log and not proceed with SageMaker part of simulation.
-    else:
-        logger.info(f"Job {job_id}: Invoking SageMaker endpoint '{SAGEMAKER_ENDPOINT_NAME}' with simulated text.")
-        sagemaker_predictions = invoke_sagemaker_endpoint(simulated_extracted_text)
-
-        if sagemaker_predictions:
-            logger.info(f"Job {job_id}: Received predictions from SageMaker.")
-            # Structure the final result
-            final_result = {
-                "job_id": job_id,
-                "original_s3_uri": s3_uri,
-                "document_type": document_type,
-                "textract_job_id": textract_job_id, # For reference
-                "status": "COMPLETED_SIMULATED", # Indicate simulation
-                "sagemaker_output": sagemaker_predictions,
-                # Add other fields as per the defined schema in the issue
-                "extracted_clauses": sagemaker_predictions.get("clause_extractions", []),
-                "risk_assessments": sagemaker_predictions.get("risk_classifications", []),
-                "summary": sagemaker_predictions.get("summary", {}).get("summary"),
-            }
-
-            # --- 3. Store Results (Simulated Path) ---
-            result_s3_uri = store_results_s3(job_id, final_result)
-            if result_s3_uri:
-                logger.info(f"Job {job_id}: Final results stored at {result_s3_uri}")
-                final_status_for_callback = "COMPLETED_SIMULATED"
-            else:
-                logger.error(f"Job {job_id}: Failed to store final results to S3.")
-                final_status_for_callback = "FAILED_SIMULATED_STORAGE"
-                # Potentially update final_result status before callback if needed
-
-            # --- 4. Callback (Simulated Path) ---
-            if callback_url:
-                send_callback(callback_url, job_id, final_status_for_callback, result_s3_uri=result_s3_uri)
-        else:
-            logger.error(f"Job {job_id}: Failed to get predictions from SageMaker for simulated text.")
-            if callback_url: # Send callback indicating SageMaker failure in simulated path
-                send_callback(callback_url, job_id, "FAILED_SIMULATED_SAGEMAKER",
-                              error_message="SageMaker processing failed in simulated path.")
-    # End of SIMULATION block
+    # Update DynamoDB with Textract Job ID
+    update_job_status_in_db(job_id, "TEXTRACT_STARTED", {"textract_job_id": textract_job_id})
 
     # --- Return Initial Response ---
-    # The primary Lambda returns "IN_PROGRESS" because Textract is async.
-    # The callback (if provided) for the *initial* request might also indicate "IN_PROGRESS".
-    # A more refined callback strategy could be used for the initial vs. final notification.
+    # The primary Lambda now returns "PROCESSING_STARTED" (or similar) and the job_id.
+    # All further processing is asynchronous.
     initial_response_payload = {
         "job_id": job_id,
         "s3_uri": s3_uri,
-        "textract_job_id": textract_job_id,
-        "status": "IN_PROGRESS",
-        "message": "Document processing initiated. Textract job started.",
-        "simulation_note": "SageMaker invocation and result storage are SIMULATED in this response path "
-                           "for demonstration. Actual processing is asynchronous."
+        "status": "PROCESSING_STARTED", # Or PENDING_TEXTRACT
+        "message": "Document processing initiated. Awaiting Textract completion.",
+        "textract_job_id": textract_job_id # Include for client reference if useful
     }
-    if callback_url: # Optional: send an initial "IN_PROGRESS" callback
-        send_callback(callback_url, job_id, "IN_PROGRESS", error_message=None)
-
+    # No direct callback here for "IN_PROGRESS"; callback will be sent by completion handler.
 
     return {
         "statusCode": 202, # Accepted
@@ -304,63 +235,95 @@ def process_contract_request(event, context):
     }
 
 
+# --- Helper to update DynamoDB (can be moved to a shared utils if needed) ---
+from datetime import datetime, timezone
+dynamodb_resource = boto3.resource("dynamodb", region_name=AWS_REGION)
+DYNAMODB_JOBS_TABLE_NAME = os.environ.get("DYNAMODB_JOBS_TABLE_NAME")
+
+def update_job_status_in_db(job_id: str, new_status: str, updates: dict = None):
+    """Updates the job status and other attributes in DynamoDB."""
+    if not DYNAMODB_JOBS_TABLE_NAME:
+        logger.error("DYNAMODB_JOBS_TABLE_NAME not configured. Cannot update job status.")
+        return
+
+    table = dynamodb_resource.Table(DYNAMODB_JOBS_TABLE_NAME)
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    update_expression_parts = ["SET #status_val = :status_val", "#updated_at_val = :updated_at_val"]
+    expression_attribute_values = {
+        ":status_val": new_status,
+        ":updated_at_val": timestamp,
+    }
+    expression_attribute_names = {
+        "#status_val": "status", # 'status' is a reserved keyword
+        "#updated_at_val": "updated_at"
+    }
+
+    if updates:
+        for key, value in updates.items():
+            # Ensure keys don't conflict with reserved words or existing placeholders
+            attr_name_placeholder = f"#{key.replace('-', '_')}_val" # Basic sanitization for attribute names
+            attr_value_placeholder = f":{key.replace('-', '_')}_val"
+            
+            if attr_name_placeholder in expression_attribute_names: # Handle potential collisions if keys are similar
+                idx = 0
+                while f"{attr_name_placeholder}{idx}" in expression_attribute_names:
+                    idx += 1
+                attr_name_placeholder = f"{attr_name_placeholder}{idx}"
+                attr_value_placeholder = f":{attr_value_placeholder.lstrip(':')}{idx}"
+
+
+            update_expression_parts.append(f"{attr_name_placeholder} = {attr_value_placeholder}")
+            expression_attribute_names[attr_name_placeholder] = key
+            expression_attribute_values[attr_value_placeholder] = value
+    
+    update_expression = ", ".join(update_expression_parts)
+
+    try:
+        logger.info(f"Updating job {job_id} in DynamoDB. Status: {new_status}, Updates: {updates}")
+        table.update_item(
+            Key={"job_id": job_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames=expression_attribute_names,
+            ExpressionAttributeValues=expression_attribute_values,
+            ReturnValues="UPDATED_NEW",
+        )
+        logger.info(f"DynamoDB update successful for job {job_id}.")
+    except Exception as e:
+        logger.error(f"Error updating job {job_id} in DynamoDB: {e}", exc_info=True)
+
+
 # --- Example Usage (for local testing, not part of Lambda deployment) ---
 if __name__ == "__main__":
-    # Mock event and context
-    sample_event = {
-        "document_type": "NDA",
-        "s3_uri": "s3://your-actual-test-bucket/sample-document.pdf", # Replace with a real S3 URI if testing Textract
-        "callback_url": "https://webhook.site/your-unique-id" # Replace with a real callback URL (e.g., from webhook.site)
-    }
-    sample_context = {}
+    # This local test block needs significant updates to mock DynamoDB and the new Textract call signature.
+    # For brevity, focusing on the handler logic changes above.
+    # To test locally:
+    # 1. Set up mock DynamoDB (e.g., using `moto.mock_dynamodb2`).
+    # 2. Mock `ocr.start_textract_job` or the direct boto3 Textract client call.
+    # 3. Ensure environment variables like DYNAMODB_JOBS_TABLE_NAME, TEXTRACT_SNS_TOPIC_ARN, TEXTRACT_IAM_ROLE_ARN are set.
 
-    # Set environment variables for local testing:
-    os.environ["AWS_REGION"] = "us-east-1" # Your AWS region
-    os.environ["RESULT_S3_BUCKET"] = "your-results-s3-bucket-name" # Replace with your bucket
-    os.environ["SAGEMAKER_ENDPOINT_NAME"] = "your-sagemaker-endpoint-name" # Replace if testing SageMaker
-    os.environ["TEXTRACT_SQS_QUEUE_URL"] = "your-textract-sqs-queue-url" # From previous setup
-    os.environ["TEXTRACT_SNS_TOPIC_ARN"] = "your-textract-sns-topic-arn" # From previous setup
-    os.environ["TEXTRACT_IAM_ROLE_ARN"] = "your-textract-iam-role-arn"   # From previous setup
-
-    # Create dummy S3 bucket and object for Textract if they don't exist (requires AWS CLI or boto3 setup)
-    # For a quick local test without actual AWS calls for Textract/Sagemaker, you might need to
-    # further mock the boto3 clients within the functions if ocr.start_textract_job and
-    # invoke_sagemaker_endpoint are called.
-    # The current code will attempt to make real AWS calls if not mocked.
-
-    print("--- Running Local Test ---")
-    if not os.environ.get("RESULT_S3_BUCKET") or \
-       not os.environ.get("TEXTRACT_SQS_QUEUE_URL") or \
-       not os.environ.get("TEXTRACT_SNS_TOPIC_ARN") or \
-       not os.environ.get("TEXTRACT_IAM_ROLE_ARN"):
-        print("Warning: Some environment variables for AWS resources are not set. "
-              "Full functionality testing requires these to be configured.")
-        print("Proceeding with potentially limited local test...")
-
-
-    # To prevent actual AWS calls during a simple structural test, you could temporarily
-    # assign mock functions or use a mocking library like `unittest.mock`.
-    # For this example, we'll let it run but it will fail if resources aren't available.
-
-    # A more robust local test might involve:
-    # from unittest.mock import patch
-    # @patch('src.preprocess.ocr.start_textract_job')
-    # @patch('boto3.client')
-    # def run_test(mock_boto_client, mock_start_textract):
-    #     mock_s3 = mock_boto_client.return_value
-    #     mock_sagemaker = mock_boto_client.return_value
-    #     mock_start_textract.return_value = "fake-textract-job-id"
-    #     mock_sagemaker.invoke_endpoint.return_value = {
-    #         "Body": io.BytesIO(json.dumps({"summary": "mock summary"}).encode())
-    #     }
-    #     mock_s3.put_object.return_value = {}
-    #     response = process_contract_request(sample_event, sample_context)
-    #     print("\n--- Lambda Response ---")
-    #     print(json.dumps(response, indent=2))
-    # run_test()
-
-    # Direct call for now (will make AWS calls if env vars are set and valid)
-    response = process_contract_request(sample_event, sample_context)
-    print("\n--- Lambda Response ---")
-    print(json.dumps(response, indent=2))
-    print("\nNote: If testing actual AWS integration, ensure the S3 URI, SQS, SNS, IAM Role, and SageMaker endpoint are correctly configured.")
+    print("--- Local Test Placeholder ---")
+    print("To test 'process_contract_request' locally, you need to:")
+    print("1. Mock AWS services (DynamoDB, Textract).")
+    print("2. Set all required environment variables (see Lambda config in Terraform).")
+    print("3. Create a sample event similar to API Gateway input.")
+    
+    # Example of what a test call might look like (needs full mocking context):
+    # sample_event_local = {
+    #     "document_type": "txt",
+    #     "s3_uri": "s3://my-test-bucket/sample.txt",
+    #     "callback_url": "http://localhost/callback"
+    # }
+    # with moto.mock_dynamodb(), moto.mock_textract(): # Simplified moto context
+    #     # Setup mock DynamoDB table
+    #     # Setup mock Textract start_document_text_detection response
+    #     # Set env vars:
+    #     os.environ["DYNAMODB_JOBS_TABLE_NAME"] = "contractintel-jobs-local"
+    #     os.environ["TEXTRACT_SNS_TOPIC_ARN"] = "arn:aws:sns:us-east-1:000000000000:dummy-topic"
+    #     os.environ["TEXTRACT_IAM_ROLE_ARN"] = "arn:aws:iam::000000000000:role/dummy-role"
+    #     # ... (other env vars)
+    #
+    #     # Call the handler
+    #     # response = process_contract_request(sample_event_local, {})
+    #     # print(json.dumps(response, indent=2))
+    pass

@@ -69,9 +69,8 @@ resource "aws_iam_policy" "lambda_service_interaction_policy" {
           "s3:GetObjectVersion"
         ],
         Resource = [
-          "arn:aws:s3:::${var.project_name}-${var.input_s3_bucket_name}/*",
-          # If Lambda needs to read from the models bucket (e.g. for some config)
-          # "arn:aws:s3:::${var.project_name}-${var.models_s3_bucket_name}/*"
+          aws_s3_bucket.input_bucket.arn, # Grant access to the bucket itself for ListBucket etc. if needed by code
+          "${aws_s3_bucket.input_bucket.arn}/*" # Grant access to objects within the bucket
         ]
       },
       {
@@ -81,8 +80,19 @@ resource "aws_iam_policy" "lambda_service_interaction_policy" {
           "s3:PutObjectAcl" # If ACLs are managed by Lambda
         ],
         Resource = [
-          "arn:aws:s3:::${var.project_name}-${var.results_s3_bucket_name}/*"
+          aws_s3_bucket.results_bucket.arn,
+          "${aws_s3_bucket.results_bucket.arn}/*"
         ]
+      },
+      { # KMS permissions for SSE-KMS encrypted S3 buckets
+        Effect = "Allow",
+        Action = [
+          "kms:Decrypt",         # Needed to read objects from SSE-KMS buckets
+          "kms:GenerateDataKey", # Needed to write objects to SSE-KMS buckets
+          "kms:DescribeKey"      # Potentially useful for troubleshooting
+        ],
+        # Restrict to the specific KMS key used for S3 buckets
+        Resource = [aws_kms_key.s3_kms_key.arn]
       },
       {
         Effect   = "Allow",
@@ -103,8 +113,20 @@ resource "aws_iam_policy" "lambda_service_interaction_policy" {
           "sqs:GetQueueAttributes"
         ],
         Resource = [
-          aws_sqs_queue.textract_queue.arn
+          # This was for the old SQS setup, may or may not be needed
+          # If ocr.py still sends a custom message to this queue, keep it.
+          # aws_sqs_queue.textract_queue.arn
           # Add DLQ ARN if Lambda interacts with it
+        ]
+      },
+      {
+        Effect   = "Allow",
+        Action   = [
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ],
+        Resource = [
+          aws_dynamodb_table.jobs_table.arn
         ]
       },
       {
@@ -122,7 +144,7 @@ resource "aws_iam_policy" "lambda_service_interaction_policy" {
         Effect = "Allow",
         Action = "iam:PassRole",
         Resource = [
-            aws_iam_role.textract_service_role.arn
+            aws_iam_role.textract_service_role.arn # Ensure this role can publish to the new SNS topic
         ],
         Condition = {
             StringEqualsIfExists = {
@@ -138,6 +160,85 @@ resource "aws_iam_role_policy_attachment" "lambda_service_interaction_attach" {
   role       = aws_iam_role.lambda_execution_role.name
   policy_arn = aws_iam_policy.lambda_service_interaction_policy.arn
 }
+
+
+# --- Post-Processing Lambda Execution Role ---
+resource "aws_iam_role" "post_processing_lambda_role" {
+  name = "${var.project_name}-post-processing-lambda-role"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [{
+      Action    = "sts:AssumeRole",
+      Effect    = "Allow",
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+  tags = {
+    Name    = "${var.project_name}-post-processing-lambda-role"
+    Project = var.project_name
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "post_processing_lambda_base_attach" {
+  role       = aws_iam_role.post_processing_lambda_role.name
+  policy_arn = aws_iam_policy.lambda_base_policy.arn # Reuse base policy for logs and VPC
+}
+
+# Policy for Post-Processing Lambda
+resource "aws_iam_policy" "post_processing_lambda_policy" {
+  name        = "${var.project_name}-post-processing-lambda-policy"
+  description = "Policy for Post-Processing Lambda to interact with DynamoDB, Textract, SageMaker, S3"
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = [
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Query" # If needed for looking up Textract JobId
+        ],
+        Resource = aws_dynamodb_table.jobs_table.arn
+      },
+      {
+        Effect   = "Allow",
+        Action   = [
+          "textract:GetDocumentTextDetection"
+          # Add other Get* actions if different Textract features are used
+        ],
+        Resource = "*" # Textract Get actions often require *
+      },
+      {
+        Effect   = "Allow",
+        Action   = [
+          "sagemaker:InvokeEndpoint"
+        ],
+        Resource = aws_sagemaker_endpoint.main.arn
+      },
+      {
+        Effect   = "Allow",
+        Action   = [
+          "s3:PutObject"
+        ],
+        Resource = "${aws_s3_bucket.results_bucket.arn}/*" # Allow putting objects into results bucket
+      }
+      # If this Lambda also sends callbacks or publishes to another SNS:
+      # {
+      #   Effect = "Allow",
+      #   Action = "sns:Publish",
+      #   Resource = "arn_of_another_sns_topic_if_needed"
+      # }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "post_processing_lambda_policy_attach" {
+  role       = aws_iam_role.post_processing_lambda_role.name
+  policy_arn = aws_iam_policy.post_processing_lambda_policy.arn
+}
+
 
 # --- SageMaker Execution Role ---
 resource "aws_iam_role" "sagemaker_execution_role" {
@@ -260,9 +361,8 @@ resource "aws_iam_policy" "textract_sns_publish_policy" {
     Statement = [{
       Effect   = "Allow",
       Action   = "sns:Publish",
-      # Resource will be the SNS Topic ARN, defined in sns.tf (or use variable)
-      # For now, using a placeholder, will need to replace with actual SNS topic ARN
-      Resource = "arn:aws:sns:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.project_name}-TextractCompletionTopic"
+      # Ensure this points to the NEW central SNS topic for processing notifications
+      Resource = aws_sns_topic.processing_notifications.arn # From sns.tf
     }]
   })
 }
@@ -327,3 +427,52 @@ resource "aws_api_gateway_account" "main" {
 # --- Data resource to get current AWS account ID and region ---
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
+
+
+# --- Query Lambda Execution Role (for GET /v1/contracts/{job_id}) ---
+resource "aws_iam_role" "query_lambda_role" {
+  name = "${var.project_name}-query-lambda-role"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [{
+      Action    = "sts:AssumeRole",
+      Effect    = "Allow",
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+  tags = {
+    Name    = "${var.project_name}-query-lambda-role"
+    Project = var.project_name
+  }
+}
+
+# Attach base policy (logs, VPC)
+resource "aws_iam_role_policy_attachment" "query_lambda_base_attach" {
+  role       = aws_iam_role.query_lambda_role.name
+  policy_arn = aws_iam_policy.lambda_base_policy.arn
+}
+
+# Policy for Query Lambda to access DynamoDB
+resource "aws_iam_policy" "query_lambda_dynamodb_policy" {
+  name        = "${var.project_name}-query-lambda-dynamodb-policy"
+  description = "Policy for Query Lambda to get items from DynamoDB jobs table"
+  policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = [
+          "dynamodb:GetItem"
+        ],
+        Resource = aws_dynamodb_table.jobs_table.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "query_lambda_dynamodb_attach" {
+  role       = aws_iam_role.query_lambda_role.name
+  policy_arn = aws_iam_policy.query_lambda_dynamodb_policy.arn
+}

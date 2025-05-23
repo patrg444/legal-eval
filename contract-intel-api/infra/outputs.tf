@@ -39,13 +39,18 @@ output "models_s3_bucket_id" {
 }
 
 output "textract_sqs_queue_url" {
-  description = "URL of the Textract SQS queue."
-  value       = aws_sqs_queue.textract_queue.id # .id returns the URL for SQS queues
+  description = "URL of the Textract SQS queue (used by ocr.py for initial message)."
+  value       = try(aws_sqs_queue.textract_queue.id, null) # Keep if still used by ocr.py
 }
 
 output "textract_sqs_dlq_url" {
   description = "URL of the Textract SQS Dead Letter Queue."
-  value       = aws_sqs_queue.textract_dlq.id # .id returns the URL for SQS queues
+  value       = try(aws_sqs_queue.textract_dlq.id, null) # Keep if still used
+}
+
+output "textract_completion_sns_topic_arn" {
+  description = "ARN of the original Textract completion SNS topic (if still used, might be superseded)."
+  value       = try(aws_sns_topic.textract_completion_topic.arn, null) # From sqs.tf, may be superseded
 }
 
 output "sagemaker_endpoint_name" {

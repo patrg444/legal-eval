@@ -244,3 +244,57 @@ contract-intel-api/
     │   └── test_api_flow.py
     └── ... # Placeholder for unit tests
 ```
+
+## Data Privacy
+
+This solution is designed with data privacy in mind. Customer documents uploaded for analysis are processed by AWS Textract and a SageMaker AI model. The original documents and extracted text are stored temporarily in customer-controlled S3 buckets created by this solution within your AWS account. 
+
+*   The `InputBucket` (for uploaded documents) and `ResultsBucket` (for JSON analysis results) are configured with a default 30-day lifecycle policy to automatically purge data. You can adjust this retention period by modifying the `S3DocumentRetentionDays` parameter when deploying via the SAR template, or by directly changing the `s3_document_retention_days` variable in the Terraform configuration (`infra/variables.tf`) if deploying manually.
+*   We do not store customer documents or their content outside of these S3 buckets and other transient AWS resources (like Lambda memory during processing) within your AWS account.
+*   All S3 buckets are configured with server-side encryption (SSE-S3 by default, with options for SSE-KMS via Terraform).
+*   Access to AWS services is managed via fine-grained IAM roles and, for the API, through a private API Gateway endpoint accessible only within your VPC, further enhancing data isolation.
+
+## Pricing Guidelines
+
+The cost of running this Contract Intelligence API will depend on your usage and the AWS resources consumed. Key cost drivers include:
+
+*   **AWS SageMaker Endpoint:** Billed per hour based on the instance type (e.g., `ml.m5.large`, `ml.g4dn.xlarge`) and number of instances. Costs vary significantly by region and instance type. (e.g., An `ml.m5.large` might be around $0.10 - $0.25 per hour per instance in `us-east-1`). Autoscaling is configured by default.
+*   **AWS Lambda:** Billed based on the number of requests and execution duration. AWS provides a generous free tier.
+*   **AWS Textract:** Billed per page processed. For `DetectDocumentText` (used for OCR), the cost is approximately $0.0015 per page for the first 1 million pages, then tiered.
+*   **Amazon S3:** Storage costs (e.g., Standard tier is around $0.023 per GB-month in `us-east-1`) and request costs (e.g., PUT, GET requests).
+*   **Amazon DynamoDB:** Billed for on-demand capacity (reads/writes) and storage. The `JobsTable` uses on-demand capacity.
+*   **API Gateway:** Billed per million requests, plus data transfer out. A free tier is available.
+*   **Amazon SNS, Amazon CloudWatch Logs:** Typically have free tiers and then low per-request or per-GB ingested/stored costs.
+
+**Illustrative Example:**
+
+Let's estimate costs for processing 100 contracts per month, each averaging 10 pages. We'll assume the SageMaker endpoint uses one `ml.m5.large` instance running continuously (approximately 730 hours/month).
+
+*   **SageMaker:** 1 instance * ~$0.15/hour * 730 hours = ~$109.50
+*   **Textract:** 100 contracts * 10 pages/contract * $0.0015/page = $1.50
+*   **Lambda:** (Assuming ~1200 invocations for all three Lambdas related to 100 contracts, with average duration of 500ms for main, 5s for completion, 200ms for query, and 512MB-1GB memory) - Costs would likely be minimal, potentially under $1.00 after free tier.
+*   **S3 Storage:** (Assuming 100 contracts * 1MB/contract = 100MB for input, plus similar for results) - Storage cost would be negligible (e.g., < $0.01). Request costs also minimal at this volume.
+*   **DynamoDB:** (100 initial writes, ~200 updates for status, 100 reads for queries) - On-demand costs would be very low, likely < $0.50.
+*   **API Gateway, SNS, CloudWatch:** Likely < $1.00 for this volume, mostly within free tiers.
+
+*   **Estimated Total (Illustrative):** ~$110 - $120 per month.
+
+**Note:** This is a simplified example. Actual costs can vary significantly based on:
+*   **Contract Complexity & Size:** Affects Textract processing time and pages, Lambda duration, and SageMaker inference time.
+*   **SageMaker Instance Type & Count:** Larger or GPU instances are more expensive. Autoscaling can optimize costs but depends on traffic patterns.
+*   **Data Transfer:** Costs for data transfer in/out of AWS services, especially S3 and API Gateway, if significant.
+*   **Region:** AWS prices vary by region.
+*   **Log Volume:** Extensive logging to CloudWatch can increase costs.
+*   **API Key/Usage Plan:** If you implement more complex API Gateway features, they may have associated costs.
+
+We strongly recommend using the [AWS Pricing Calculator](https://calculator.aws/) to create a detailed estimate based on your specific usage patterns, desired SageMaker instance types, and AWS region.
+
+## Support
+
+Support for this solution is provided via GitHub Issues on this repository. Please provide detailed information when opening an issue, including:
+*   A clear description of the issue.
+*   Steps to reproduce the issue.
+*   Relevant logs or error messages.
+*   Your deployment configuration (e.g., if deployed via SAR or Terraform, any customizations).
+
+We aim to address issues based on severity and community feedback. Please note that response times may vary. For enterprise-level support or custom modifications, please contact [Your Company Name/Contact - Placeholder, e.g., `opensource@example.com` or link to a commercial support offering].

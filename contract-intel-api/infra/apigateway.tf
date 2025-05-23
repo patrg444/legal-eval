@@ -119,6 +119,7 @@ resource "aws_lambda_permission" "api_gateway_invoke_lambda" {
   # Example: "arn:aws:execute-api:us-east-1:123456789012:abcdef123/test/POST/mydemoresource"
   # Using /*/*/* for simplicity if path/stage is dynamic or for any method on the API
   # source_arn = "${aws_api_gateway_rest_api.main.execution_arn}/*/*"
+  api_key_required = true # Require API Key for this method
 }
 
 
@@ -134,7 +135,9 @@ resource "aws_api_gateway_method" "contract_job_get" {
   rest_api_id   = aws_api_gateway_rest_api.main.id
   resource_id   = aws_api_gateway_resource.contract_job.id
   http_method   = "GET"
-  authorization = "NONE"
+  authorization = "NONE" # Authorization can be NONE if API key is the primary mechanism here.
+                          # Or use AWS_IAM if requests are signed.
+  api_key_required = true # Require API Key for this method
 
   # Define request parameters if needed (e.g., for job_id)
   request_parameters = {
@@ -157,6 +160,11 @@ resource "aws_api_gateway_integration" "contract_job_get_mock" {
   # Mock response
   # Note: aws_api_gateway_method_response and aws_api_gateway_integration_response
   # are needed for full mock setup. This is a simplified mock.
+  # Removing MOCK integration as we are now integrating with a real Lambda
+  type                    = "AWS_PROXY" # For Lambda proxy integration
+  uri                     = aws_lambda_function.query_lambda.invoke_arn
+  integration_http_method = "POST" # Required for AWS_PROXY to Lambda
+  # Credentials not typically needed for AWS_PROXY with resource-based policy on Lambda
 }
 
 # --- API Gateway Method Response (for GET 200) ---
@@ -165,28 +173,79 @@ resource "aws_api_gateway_method_response" "job_get_200" {
   resource_id = aws_api_gateway_resource.contract_job.id
   http_method = aws_api_gateway_method.contract_job_get.http_method
   status_code = "200"
-  # Define response models if needed
-  # response_models = {
-  #   "application/json" = "Empty" # Or a defined model
-  # }
+  response_models = {
+    "application/json" = "Empty" # Standard practice, actual model validation by Lambda
+  }
 }
 
-# --- API Gateway Integration Response (for GET Mock) ---
-resource "aws_api_gateway_integration_response" "job_get_mock_response" {
-  rest_api_id = aws_api_gateway_rest_api.main.id
-  resource_id = aws_api_gateway_resource.contract_job.id
-  http_method = aws_api_gateway_method.contract_job_get.http_method
-  status_code = aws_api_gateway_method_response.job_get_200.status_code
+# Integration response is not strictly needed for AWS_PROXY if Lambda returns the exact format.
+# However, it can be defined if transformations or header mappings are needed.
+# For now, relying on Lambda to return the correct proxy format.
+# resource "aws_api_gateway_integration_response" "job_get_lambda_response" {
+#   rest_api_id = aws_api_gateway_rest_api.main.id
+#   resource_id = aws_api_gateway_resource.contract_job.id
+#   http_method = aws_api_gateway_method.contract_job_get.http_method
+#   status_code = aws_api_gateway_method_response.job_get_200.status_code
+#   # No response templates for AWS_PROXY if Lambda output is already correct
+# }
 
-  response_templates = {
-    "application/json" = jsonencode({
-      job_id      = "$input.params('job_id')",
-      status      = "PROCESSING_MOCK",
-      message     = "This is a mock response for job status.",
-      # Placeholder for actual job details
-      results_uri = "s3://${var.project_name}-${var.results_s3_bucket_name}/results/$input.params('job_id')/output.json"
-    })
+# --- Lambda Permission for API Gateway to invoke Query Lambda ---
+resource "aws_lambda_permission" "api_gateway_invoke_query_lambda" {
+  statement_id  = "AllowAPIGatewayInvokeQueryLambda"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.query_lambda.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.main.id}/*/${aws_api_gateway_method.contract_job_get.http_method}${aws_api_gateway_resource.contract_job.path}"
+}
+
+
+# --- API Gateway API Key ---
+resource "aws_api_gateway_api_key" "main_key" {
+  name    = "${var.project_name}-main-api-key"
+  enabled = true
+  # value = "your-api-key-value" # Optional: If you want to set a specific key value. Otherwise, it's auto-generated.
+  # customer_id = "example-customer" # Optional
+
+  tags = {
+    Name    = "${var.project_name}-main-api-key"
+    Project = var.project_name
   }
+}
+
+# --- API Gateway Usage Plan ---
+resource "aws_api_gateway_usage_plan" "main_plan" {
+  name = "${var.project_name}-main-usage-plan"
+  # description = "Main usage plan for the Contract Intelligence API"
+
+  api_stages {
+    api_id = aws_api_gateway_rest_api.main.id
+    stage  = aws_api_gateway_stage.main.stage_name
+  }
+
+  throttle_settings {
+    # Example: Allow 10 requests per second, with a burst of 5 requests
+    rate_limit = 10
+    burst_limit = 5
+  }
+
+  quota_settings {
+    # Example: Allow 1000 requests per day
+    limit  = 1000
+    period = "DAY" # MONTH, WEEK
+    # offset = 1 # Day of the month to start the quota period (e.g., 1 for first day)
+  }
+
+  tags = {
+    Name    = "${var.project_name}-main-usage-plan"
+    Project = var.project_name
+  }
+}
+
+# --- API Gateway Usage Plan Key (Associate API Key with Usage Plan) ---
+resource "aws_api_gateway_usage_plan_key" "main_plan_key" {
+  key_id        = aws_api_gateway_api_key.main_key.id
+  key_type      = "API_KEY" # Or "AWS_SECRET_ACCESS_KEY" for IAM-based auth on usage plan
+  usage_plan_id = aws_api_gateway_usage_plan.main_plan.id
 }
 
 

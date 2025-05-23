@@ -36,8 +36,8 @@ resource "aws_sagemaker_endpoint_configuration" "main" {
   production_variants {
     variant_name           = "AllTraffic" # Name for this variant
     model_name             = aws_sagemaker_model.main.name
-    instance_type          = var.sagemaker_instance_type
-    initial_instance_count = 1
+    instance_type          = var.sagemaker_endpoint_instance_type # Use new variable
+    initial_instance_count = var.sagemaker_autoscale_min_instances # Start with min capacity
     # initial_variant_weight = 1.0 # If only one variant
     # serverless_config {} # For SageMaker Serverless Inference (if applicable)
   }
@@ -71,6 +71,40 @@ resource "aws_sagemaker_endpoint" "main" {
     Environment = "dev"
   }
 }
+
+# --- SageMaker Endpoint Autoscaling ---
+resource "aws_appautoscaling_target" "sagemaker_endpoint_target" {
+  max_capacity       = var.sagemaker_autoscale_max_instances
+  min_capacity       = var.sagemaker_autoscale_min_instances
+  resource_id        = "endpoint/${aws_sagemaker_endpoint.main.name}/variant/AllTraffic" # Variant name must match
+  scalable_dimension = "sagemaker:variant:DesiredInstanceCount"
+  service_namespace  = "sagemaker"
+
+  # Ensure endpoint is created before trying to attach autoscaling
+  depends_on = [aws_sagemaker_endpoint.main]
+}
+
+resource "aws_appautoscaling_policy" "sagemaker_endpoint_invocations_policy" {
+  name               = "${var.project_name}-sagemaker-invocations-scaling-policy"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.sagemaker_endpoint_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.sagemaker_endpoint_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.sagemaker_endpoint_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      # See https://docs.aws.amazon.com/sagemaker/latest/dg/endpoint-scaling-load-testing.html
+      # For CPU-based models, SageMakerVariantInvocationsPerInstance is often a good choice.
+      # Or SageMakerVariantProvisionedConcurrencyUtilization if using provisioned concurrency (serverless).
+      # Or a custom metric if needed.
+      predefined_metric_type = "SageMakerVariantInvocationsPerInstance"
+    }
+    target_value       = var.sagemaker_autoscale_target_utilization
+    scale_in_cooldown  = 300 # seconds (e.g., 5 minutes)
+    scale_out_cooldown = 60  # seconds (e.g., 1 minute)
+  }
+}
+
 
 # --- Security Group for SageMaker Endpoint (if VPC enabled) ---
 resource "aws_security_group" "sagemaker_sg" {

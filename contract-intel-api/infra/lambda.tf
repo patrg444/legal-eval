@@ -22,11 +22,13 @@ resource "aws_lambda_function" "main" {
   environment {
     variables = {
       AWS_REGION             = var.aws_region
-      RESULT_S3_BUCKET       = aws_s3_bucket.results_bucket.id
-      SAGEMAKER_ENDPOINT_NAME = aws_sagemaker_endpoint.main.name
-      TEXTRACT_SQS_QUEUE_URL = aws_sqs_queue.textract_queue.id # This is the SQS URL
-      TEXTRACT_SNS_TOPIC_ARN = aws_sns_topic.textract_completion_topic.arn # From sqs.tf
-      TEXTRACT_IAM_ROLE_ARN  = aws_iam_role.textract_service_role.arn # From iam.tf
+      RESULT_S3_BUCKET       = aws_s3_bucket.results_bucket.id # Still needed if main lambda has any fallback/error S3 writes
+      SAGEMAKER_ENDPOINT_NAME = aws_sagemaker_endpoint.main.name # Needed by post-processing lambda
+      # TEXTRACT_SQS_QUEUE_URL = aws_sqs_queue.textract_queue.id # May not be needed by main lambda anymore
+      # TEXTRACT_SNS_TOPIC_ARN is now the central one for notifications
+      TEXTRACT_SNS_TOPIC_ARN = aws_sns_topic.processing_notifications.arn # CENTRAL SNS TOPIC
+      TEXTRACT_IAM_ROLE_ARN  = aws_iam_role.textract_service_role.arn # Role Textract assumes
+      DYNAMODB_JOBS_TABLE_NAME = aws_dynamodb_table.jobs_table.name # For main and post-processing lambdas
       # Add other environment variables required by handler.py
       # e.g. LOG_LEVEL = "INFO"
     }
@@ -110,6 +112,61 @@ resource "aws_security_group" "lambda_sg" {
   }
 }
 
+
+# --- Query Lambda Function (for GET /v1/contracts/{job_id}) ---
+resource "aws_lambda_function" "query_lambda" {
+  function_name = "${var.project_name}-query-handler"
+  # Assuming the same deployment package contains this handler
+  s3_bucket = "${var.project_name}-lambda-deployments" # Placeholder, use your actual bucket
+  s3_key    = var.lambda_zip_s3_key                 # "lambda_deployment_package.zip"
+
+  handler = "src.api.query_handler.get_contract_status" # Path to the new handler
+  role    = aws_iam_role.query_lambda_role.arn # New dedicated role
+  runtime = var.lambda_runtime
+
+  timeout     = 30  # seconds
+  memory_size = 256 # MB (likely less resource intensive than processing lambdas)
+
+  environment {
+    variables = {
+      AWS_REGION                = var.aws_region
+      DYNAMODB_JOBS_TABLE_NAME  = aws_dynamodb_table.jobs_table.name
+    }
+  }
+
+  # VPC Configuration (optional for this Lambda if only accessing DynamoDB via public endpoint,
+  # but recommended for consistency if other Lambdas are in VPC and using DynamoDB VPC endpoint)
+  # If DynamoDB VPC endpoint exists and is used, then VPC config is needed.
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda_sg.id] # Can reuse or create a new one
+  }
+
+  tags = {
+    Name        = "${var.project_name}-query-lambda"
+    Project     = var.project_name
+    Environment = "dev"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.query_lambda_base_attach,
+    aws_iam_role_policy_attachment.query_lambda_dynamodb_attach,
+    aws_cloudwatch_log_group.query_lambda_lg,
+    aws_dynamodb_table.jobs_table
+  ]
+}
+
+# --- CloudWatch Log Group for Query Lambda Function ---
+resource "aws_cloudwatch_log_group" "query_lambda_lg" {
+  name              = "/aws/lambda/${var.project_name}-query-handler"
+  retention_in_days = 14
+
+  tags = {
+    Name    = "${var.project_name}-query-lambda-log-group"
+    Project = var.project_name
+  }
+}
+
 # --- CloudWatch Log Group for Lambda Function ---
 resource "aws_cloudwatch_log_group" "lambda_lg" {
   name              = "/aws/lambda/${var.project_name}-main-handler"
@@ -163,6 +220,7 @@ resource "aws_cloudwatch_log_group" "lambda_lg" {
 #   api/
 #     __init__.py
 #     handler.py
+#     completion_handler.py # New handler
 #   preprocess/
 #     __init__.py
 #     ocr.py
@@ -176,11 +234,90 @@ resource "aws_cloudwatch_log_group" "lambda_lg" {
 # - VPC ENI creation/deletion (covered by `lambda_base_policy`).
 # - S3 GetObject from input bucket, PutObject to results bucket.
 # - Textract Start/Get operations.
-# - SQS SendMessage to the Textract SQS queue.
-# - SageMaker InvokeEndpoint.
+# - SQS SendMessage to the Textract SQS queue. (May be removed if ocr.py changes)
+# - DynamoDB PutItem/UpdateItem.
 # - iam:PassRole for the Textract service role.
 # These are covered in `lambda_service_interaction_policy` in `iam.tf`.
 # Ensure the Sagemaker endpoint name and SQS queue URL are correctly passed as env vars.
 # The `TEXTRACT_SQS_QUEUE_URL` should be the `.id` attribute of the `aws_sqs_queue` resource,
 # as this attribute returns the URL of the queue.
 # (Corrected in environment variables block: `aws_sqs_queue.textract_queue.id`)
+
+
+# --- SNS-Triggered Post-Processing Lambda Function ---
+resource "aws_lambda_function" "post_processing_lambda" {
+  function_name = "${var.project_name}-post-processing-handler"
+  # Assuming the same deployment package contains this handler
+  s3_bucket = "${var.project_name}-lambda-deployments" # Placeholder, use your actual bucket
+  s3_key    = var.lambda_zip_s3_key                 # "lambda_deployment_package.zip"
+  # filename = "../lambda_deployment_package.zip" # Or local path
+  # source_code_hash = filebase64sha256("../lambda_deployment_package.zip")
+
+  handler = "src.api.completion_handler.handle_processing_completion" # Adjust path if needed
+  role    = aws_iam_role.post_processing_lambda_role.arn
+  runtime = var.lambda_runtime
+
+  timeout     = 300 # Potentially longer for SageMaker processing + S3 write
+  memory_size = 512 # MB
+
+  environment {
+    variables = {
+      AWS_REGION                = var.aws_region
+      RESULT_S3_BUCKET          = aws_s3_bucket.results_bucket.id
+      SAGEMAKER_ENDPOINT_NAME    = aws_sagemaker_endpoint.main.name
+      DYNAMODB_JOBS_TABLE_NAME  = aws_dynamodb_table.jobs_table.name
+      # TEXTRACT_SNS_TOPIC_ARN is not directly needed by this lambda as it's the trigger
+      # Add any other specific env vars this lambda needs
+    }
+  }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda_sg.id] # Can reuse the same SG or create a new one
+  }
+
+  # dead_letter_config {
+  #   target_arn = aws_sqs_queue.lambda_dlq.arn # If you have a DLQ for this lambda
+  # }
+
+  tags = {
+    Name        = "${var.project_name}-post-processing-lambda"
+    Project     = var.project_name
+    Environment = "dev"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.post_processing_lambda_base_attach,
+    aws_iam_role_policy_attachment.post_processing_lambda_policy_attach,
+    aws_cloudwatch_log_group.post_processing_lambda_lg,
+    aws_dynamodb_table.jobs_table,
+    aws_sagemaker_endpoint.main
+  ]
+}
+
+# --- SNS Subscription for the Post-Processing Lambda ---
+resource "aws_sns_topic_subscription" "lambda_processing_notification_subscription" {
+  topic_arn = aws_sns_topic.processing_notifications.arn # From sns.tf
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.post_processing_lambda.arn
+}
+
+# --- Lambda Permission for SNS to invoke Post-Processing Lambda ---
+resource "aws_lambda_permission" "sns_invoke_post_processing_lambda" {
+  statement_id  = "AllowSNSInvokePostProcessingLambda"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.post_processing_lambda.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.processing_notifications.arn
+}
+
+# --- CloudWatch Log Group for Post-Processing Lambda Function ---
+resource "aws_cloudwatch_log_group" "post_processing_lambda_lg" {
+  name              = "/aws/lambda/${var.project_name}-post-processing-handler"
+  retention_in_days = 14
+
+  tags = {
+    Name    = "${var.project_name}-post-processing-lambda-log-group"
+    Project = var.project_name
+  }
+}

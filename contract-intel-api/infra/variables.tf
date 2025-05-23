@@ -77,6 +77,30 @@ variable "sagemaker_instance_type" {
   default     = "ml.m5.large" # Default to a general-purpose instance
 }
 
+variable "sagemaker_endpoint_instance_type" {
+  description = "Instance type for the SageMaker real-time endpoint."
+  type        = string
+  default     = "ml.m5.large"
+}
+
+variable "sagemaker_autoscale_min_instances" {
+  description = "Minimum number of instances for SageMaker endpoint autoscaling."
+  type        = number
+  default     = 1 # Defaulting to 1 for robustness, scale-to-zero can have cold starts.
+}
+
+variable "sagemaker_autoscale_max_instances" {
+  description = "Maximum number of instances for SageMaker endpoint autoscaling."
+  type        = number
+  default     = 2
+}
+
+variable "sagemaker_autoscale_target_utilization" {
+  description = "Target utilization (e.g., InvocationsPerInstance or CPU/GPU) for SageMaker autoscaling."
+  type        = number
+  default     = 70 # Example: 70% CPU utilization or 70 invocations per instance
+}
+
 variable "sagemaker_model_image_uri" {
   description = "ECR URI for the SageMaker model inference image."
   type        = string

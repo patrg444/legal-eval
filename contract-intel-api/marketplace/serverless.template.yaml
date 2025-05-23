@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Contract Intelligence API - Deploys core backend services (API Gateway, Lambdas, DynamoDB, S3 Buckets, SNS Topic)
+  for contract analysis. Requires a pre-existing SageMaker endpoint for full ML capabilities.
+
+Parameters:
+  StageName:
+    Type: String
+    Description: Stage name for the API Gateway and resource naming.
+    Default: Prod
+  SageMakerEndpointName:
+    Type: String
+    Description: "REQUIRED: The name of your existing SageMaker endpoint for contract analysis models."
+    # MinLength: 1 # Add constraints as needed
+  LogRetentionInDays:
+    Type: Number
+    Description: Retention period in days for CloudWatch Log Groups.
+    Default: 14
+  LambdaRuntime:
+    Type: String
+    Description: Python runtime for Lambda functions.
+    Default: python3.11
+  LambdaMemorySizeMain: # Specific for main handler
+    Type: Number
+    Description: Memory size (MB) for the main processing Lambda (API handler).
+    Default: 512
+  LambdaTimeoutMain: # Specific for main handler
+    Type: Number
+    Description: Timeout (seconds) for the main processing Lambda (API handler).
+    Default: 60
+  LambdaMemorySizeCompletion: # Specific for completion handler
+    Type: Number
+    Description: Memory size (MB) for the completion handler Lambda.
+    Default: 1024 # Potentially more memory for SageMaker client and data handling
+  LambdaTimeoutCompletion: # Specific for completion handler
+    Type: Number
+    Description: Timeout (seconds) for the completion handler Lambda.
+    Default: 300    # Longer timeout for processing pipeline
+  LambdaMemorySizeQuery: # Specific for query handler
+    Type: Number
+    Description: Memory size (MB) for the query handler Lambda.
+    Default: 256 # Smaller memory, as it's a simple DDB query
+  LambdaTimeoutQuery: # Specific for query handler
+    Type: Number
+    Description: Timeout (seconds) for the query handler Lambda.
+    Default: 30
+  S3DocumentRetentionDays:
+    Type: Number
+    Description: How long to keep documents in the input and results S3 buckets (0 to disable expiration, -1 for no rule).
+    Default: 90
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: "REQUIRED: S3 bucket name where Lambda deployment ZIP is located (e.g., your-sar-bucket)."
+  LambdaCodeS3Key:
+    Type: String
+    Description: "REQUIRED: S3 key for the Lambda deployment ZIP (e.g., packages/contract-intel-api.zip)."
+
+
+Globals: # Global settings for AWS::Serverless::Function
+  Function:
+    Runtime: !Ref LambdaRuntime
+    # Timeout & MemorySize will be set per function due to varying needs.
+    # VpcConfig can be defined here if all functions share the same VPC config.
+    # For now, assuming public endpoints or VPC config managed outside/per-function if needed.
+
+Resources:
+  # --- S3 Buckets ---
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "sar-${AWS::StackName}-input-${AWS::Region}" # SAR guidelines prefer stack name prefix
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DocumentRetentionRule
+            Status: Enabled
+            # Conditional expiration: only if S3DocumentRetentionDays > 0
+            ExpirationInDays: !If [HasRetentionDays, !Ref S3DocumentRetentionDays, !Ref "AWS::NoValue"]
+  
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "sar-${AWS::StackName}-results-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DocumentRetentionRule
+            Status: Enabled
+            ExpirationInDays: !If [HasRetentionDays, !Ref S3DocumentRetentionDays, !Ref "AWS::NoValue"]
+
+  Conditions: # Condition to check if S3DocumentRetentionDays is positive
+    HasRetentionDays: !Not [!Equals [!Ref S3DocumentRetentionDays, -1]]
+
+
+  # --- DynamoDB Table ---
+  JobsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Sub "sar-${AWS::StackName}-JobsTable"
+      PrimaryKey:
+        Name: job_id
+        Type: String
+      BillingMode: PAY_PER_REQUEST # Default for SimpleTable, explicit for clarity
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        Project: ContractIntelligenceAPI
+
+  # --- SNS Topic ---
+  ProcessingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sar-${AWS::StackName}-ProcessingNotifications"
+
+  # --- IAM Roles ---
+  TextractServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "sar-${AWS::StackName}-TextractServiceRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: textract.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TextractSNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ProcessingNotificationTopic
+
+  # --- Lambda Functions ---
+  ProcessContractLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sar-${AWS::StackName}-ProcessContractLambda"
+      Handler: src.api.handler.process_contract_request
+      CodeUri:
+        Bucket: !Ref LambdaCodeS3Bucket
+        Key: !Ref LambdaCodeS3Key
+      Description: Handles initial contract submission, starts Textract, and records job in DynamoDB.
+      MemorySize: !Ref LambdaMemorySizeMain
+      Timeout: !Ref LambdaTimeoutMain
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+        - Statement:
+          - Effect: Allow
+            Action: [textract:StartDocumentTextDetection]
+            Resource: "*"
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt TextractServiceRole.Arn
+            Condition: {StringEqualsIfExists: {"iam:PassedToService": "textract.amazonaws.com"}}
+      Environment:
+        Variables:
+          DYNAMODB_JOBS_TABLE_NAME: !Ref JobsTable
+          TEXTRACT_SNS_TOPIC_ARN: !Ref ProcessingNotificationTopic
+          TEXTRACT_IAM_ROLE_ARN: !GetAtt TextractServiceRole.Arn
+          AWS_REGION: !Ref AWS::Region
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /v1/contracts
+            Method: post
+            RestApiId: !Ref ContractApi
+
+  CompletionHandlerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sar-${AWS::StackName}-CompletionHandlerLambda"
+      Handler: src.api.completion_handler.handle_processing_completion
+      CodeUri:
+        Bucket: !Ref LambdaCodeS3Bucket
+        Key: !Ref LambdaCodeS3Key
+      Description: Handles SNS notifications for async task completions (Textract, SageMaker).
+      MemorySize: !Ref LambdaMemorySizeCompletion
+      Timeout: !Ref LambdaTimeoutCompletion
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+        - S3WritePolicy: {BucketName: !Ref ResultsBucket} # Changed from S3CrudPolicy
+        - Statement:
+          - Effect: Allow
+            Action: [textract:GetDocumentTextDetection] # Add other Get* actions as needed
+            Resource: "*"
+          - Effect: Allow
+            Action: sagemaker:InvokeEndpoint
+            Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}"
+      Environment:
+        Variables:
+          DYNAMODB_JOBS_TABLE_NAME: !Ref JobsTable
+          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
+          RESULT_S3_BUCKET: !Ref ResultsBucket
+          AWS_REGION: !Ref AWS::Region
+      Events:
+        SnsEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref ProcessingNotificationTopic
+
+  QueryHandlerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sar-${AWS::StackName}-QueryHandlerLambda"
+      Handler: src.api.query_handler.get_contract_status
+      CodeUri:
+        Bucket: !Ref LambdaCodeS3Bucket
+        Key: !Ref LambdaCodeS3Key
+      Description: Handles GET requests for job status from DynamoDB.
+      MemorySize: !Ref LambdaMemorySizeQuery
+      Timeout: !Ref LambdaTimeoutQuery
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref JobsTable}
+      Environment:
+        Variables:
+          DYNAMODB_JOBS_TABLE_NAME: !Ref JobsTable
+          AWS_REGION: !Ref AWS::Region
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /v1/contracts/{job_id}
+            Method: get
+            RestApiId: !Ref ContractApi
+
+  # --- API Gateway ---
+  ContractApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "sar-${AWS::StackName}-ContractApi"
+      StageName: !Ref StageName
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod", "resourcePath":"$context.resourcePath", "status":"$context.status", "protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowHeaders: "'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token'"
+        AllowOrigin: "'*'" # Restrict this in production
+      # API Key and Usage Plan can be defined here if needed:
+      # Auth:
+      #   ApiKeyRequired: true # Makes all methods require API key
+      #   UsagePlan:
+      #     CreateUsagePlan: PER_API
+      #     UsagePlanName: !Sub "sar-${AWS::StackName}-UsagePlan"
+      #     Description: Default usage plan for Contract Intelligence API
+      #     Quota: {Limit: 1000, Period: DAY}
+      #     Throttle: {RateLimit: 10, BurstLimit: 5}
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/sar-${AWS::StackName}-ContractApi" # Match implicit API name
+      RetentionInDays: !Ref LogRetentionInDays
+
+Outputs:
+  ApiGatewayInvokeURL:
+    Description: "Invoke URL for the API Gateway endpoint"
+    Value: !Sub "https://\${ContractApi}.execute-api.\${AWS::Region}.amazonaws.com/\${StageName}"
+  InputS3BucketName:
+    Description: "Name of the S3 bucket for input documents"
+    Value: !Ref InputBucket
+  ResultsS3BucketName:
+    Description: "Name of the S3 bucket for result documents"
+    Value: !Ref ResultsBucket
+  JobsDynamoDBTableName:
+    Description: "Name of the DynamoDB table for job tracking"
+    Value: !Ref JobsTable
+  ProcessingSNSTopicARN:
+    Description: "ARN of the SNS topic for processing notifications"
+    Value: !Ref ProcessingNotificationTopic
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: ContractIntelligenceApi
+    Description: API for ingesting legal contracts, performing OCR, and extracting insights using AI/ML models. Requires a pre-existing SageMaker endpoint for ML capabilities.
+    Author: YourCompanyName # Replace
+    SpdxLicenseId: Apache-2.0
+    LicenseUrl: s3://<your-sar-lambda-code-bucket>/<path-to-project>/LICENSE_SAR.txt # Placeholder
+    ReadmeUrl: s3://<your-sar-lambda-code-bucket>/<path-to-project>/README_SAR.md # Placeholder
+    Labels: ['ai', 'ml', 'sagemaker', 'contract-analysis', 'legaltech', 'document-processing', 'ocr', 'textract', 'serverless']
+    HomePageUrl: https://yourcompany.com/ # Placeholder
+    SemanticVersion: 0.1.0
+    SourceCodeUrl: https://github.com/your-github-username/contract-intel-api # Placeholder
+    # TemplateUrl: s3://<your-sar-lambda-code-bucket>/<path-to-project>/serverless.template.yaml # Points to itself in S3
+
+    # Required Capabilities for deploying this template
+    Capabilities: [CAPABILITY_IAM, CAPABILITY_NAMED_IAM, CAPABILITY_AUTO_EXPAND]
+```
+
+I have updated `contract-intel-api/marketplace/serverless.template.yaml` with a more SAR-friendly structure.
+Key changes include:
+-   Parameterized Lambda memory/timeout settings per function.
+-   Parameterized Lambda code S3 bucket and key.
+-   Use of `!Sub "sar-${AWS::StackName}-..."` for resource naming to ensure uniqueness and align with SAR guidelines.
+-   Conditional S3 bucket lifecycle expiration rule using `!If` and `Conditions`.
+-   Simplified S3 bucket encryption to default SSE-S3 (AES256) for broader compatibility, though SSE-KMS could be added back if a KMS key is also created by the template or provided as a parameter.
+-   Changed `S3CrudPolicy` for `CompletionHandlerLambda` to the more restrictive `S3WritePolicy` for the results bucket.
+-   Updated placeholders in `Metadata` section for URLs.
+
+Now I will create the placeholder `README_SAR.md`.
