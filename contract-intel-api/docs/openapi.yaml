@@ -1,0 +1,267 @@
+openapi: 3.0.0
+info:
+  title: Contract Intelligence API
+  version: v1.0 # Aligned with /v1 path
+  description: API for ingesting legal contracts, performing OCR, and extracting insights using AI/ML models.
+
+servers:
+  # - url: https://{your-api-id}.execute-api.{region}.amazonaws.com/{stage} # Example for deployed API
+  #   description: AWS API Gateway (Production)
+  # For private APIs, the URL might be specific to the VPC endpoint DNS.
+  - url: https://your-vpce-dns-name/ # Placeholder for PrivateLink access
+    description: Private API Gateway Endpoint (via VPC Endpoint)
+
+paths:
+  /v1/contracts:
+    post:
+      summary: Submit a new contract for processing
+      description: Accepts a contract document (via S3 URI) for asynchronous processing.
+      operationId: submitContract
+      tags:
+        - Contracts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContractSubmissionRequest'
+      responses:
+        '202':
+          description: Accepted for processing. The job_id can be used to track status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobCreationResponse'
+        '400':
+          description: Bad request (e.g., invalid input parameters)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/contracts/{job_id}:
+    get:
+      summary: Get the status and result of a contract processing job
+      description: Retrieves the current status of a processing job and the S3 URI for results if completed.
+      operationId: getJobStatus
+      tags:
+        - Contracts
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          description: ID of the contract processing job (UUID format).
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Job status and result (if available).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
+        '404':
+          description: Job not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error during processing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ContractSubmissionRequest:
+      type: object
+      properties:
+        document_type:
+          type: string
+          enum: [pdf, docx, txt] # Changed 'text' to 'txt' for commonality
+          description: The format of the document in S3.
+        s3_uri:
+          type: string
+          format: uri # Should ideally be a more specific S3 URI pattern if possible
+          description: The S3 URI of the contract document to process.
+          example: "s3://your-input-bucket/contracts/contract_v1.pdf"
+        callback_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Optional URL to send a POST notification upon job completion or failure.
+          example: "https://your-service.com/api/contract_callback"
+      required:
+        - document_type
+        - s3_uri
+
+    JobCreationResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Unique identifier for the processing job.
+        status:
+          type: string
+          enum: [IN_PROGRESS]
+          description: Initial status of the job.
+      required:
+        - job_id
+        - status
+
+    JobStatusResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Unique identifier for the processing job.
+        status:
+          type: string
+          enum: [IN_PROGRESS, SUCCEEDED, FAILED, COMPLETED_SIMULATED] # Added simulated for current handler state
+          description: Current status of the processing job.
+        result_s3_uri: # Renamed from result_s3 for clarity
+          type: string
+          format: uri
+          nullable: true
+          description: S3 URI of the JSON file containing the processing results (available if status is SUCCEEDED or COMPLETED_SIMULATED).
+          example: "s3://your-results-bucket/results/job_id/output.json"
+        error_message:
+          type: string
+          nullable: true
+          description: Details of the error if the job status is FAILED.
+        textract_job_id: # Added from handler's response
+          type: string
+          nullable: true
+          description: Identifier for the Textract job initiated.
+      required:
+        - job_id
+        - status
+
+    # Schema for the actual output.json file stored in S3
+    # This is not directly returned by the /v1/contracts/{job_id} endpoint,
+    # but describes the content pointed to by result_s3_uri.
+    ContractAnalysisResult:
+      type: object
+      description: Schema for the detailed analysis result JSON stored in S3.
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Original API job ID.
+        original_s3_uri:
+          type: string
+          format: uri
+        document_type:
+          type: string
+        textract_job_id:
+          type: string
+        status: # Status of this specific result generation
+          type: string
+        sagemaker_output: # Raw output from SageMaker endpoint
+            type: object # Placeholder for the direct SageMaker output
+            properties:
+                clause_extractions:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/ExtractedClauseSM' # SageMaker specific clause
+                risk_classifications:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/RiskClassificationSM' # SageMaker specific risk
+                summary:
+                    type: object
+                    properties:
+                        summary:
+                            type: string
+        # These are the structured fields as per the issue's section 4.3
+        meta:
+          $ref: '#/components/schemas/ResultMeta'
+        extracted_clauses: # Renamed from 'clauses' for clarity (issue 4.3)
+          $ref: '#/components/schemas/ResultClauses'
+        risk_assessments: # Renamed from 'risks' for clarity (issue 4.3)
+          $ref: '#/components/schemas/ResultRisks'
+        summary: # Top-level summary as per issue 4.3
+          type: string
+          description: Overall summary of the contract.
+
+    ExtractedClauseSM: # Placeholder for SageMaker model's direct clause output
+        type: object
+        properties:
+            clause_type: { type: string }
+            text_span: { type: array, items: { type: integer } }
+            confidence: { type: number, format: float }
+
+    RiskClassificationSM: # Placeholder for SageMaker model's direct risk output
+        type: object
+        properties:
+            risk_category: { type: string }
+            score: { type: number, format: float }
+
+    ResultMeta:
+      type: object
+      properties:
+        pages:
+          type: integer
+          description: Number of pages in the document.
+          example: 10
+        language:
+          type: string
+          description: Detected language of the document.
+          example: "en"
+
+    ResultClauses:
+      type: object
+      description: Key-value pairs of extracted clauses. The key is the clause name (e.g., "Governing Law") and the value is the extracted text for that clause.
+      additionalProperties:
+        type: string
+      example:
+        governing_law: "This Agreement shall be governed by and construed in accordance with the laws of the State of Delaware, without regard to its conflict of laws principles."
+        term: "This Agreement shall commence on the Effective Date and shall continue for a period of three (3) years, unless terminated earlier."
+
+    ResultRisks:
+      type: array
+      description: List of identified risks.
+      items:
+        $ref: '#/components/schemas/RiskItem'
+
+    RiskItem:
+      type: object
+      properties:
+        clause:
+          type: string
+          description: The specific clause or section related to the risk.
+          example: "Limitation of Liability"
+        risk_level:
+          type: string
+          enum: [LOW, MEDIUM, HIGH]
+          description: Assessed risk level.
+        details:
+          type: string
+          description: Explanation or details about the identified risk.
+          example: "The limitation of liability cap is unusually low for a contract of this nature."
+
+    ErrorResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          nullable: true
+        status:
+          type: string
+          enum: [FAILED, ERROR] # Or just FAILED
+        error: # Renamed from error_message for consistency with handler output
+          type: string
+          description: A message describing the error.
+      required:
+        - status
+        - error
+
+tags:
+  - name: Contracts
+    description: Operations related to contract processing.

@@ -1,0 +1,31 @@
+[project]
+name = "contract-intel-api"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "google-labs-jules[bot]",email = "161369871+google-labs-jules[bot]@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = "^3.11"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.2",
+    "transformers>=4.30.0",
+    "torch>=2.0.0",
+    "pydantic>=2.0.0",
+    "boto3>=1.28.0", # For AWS SDK
+    "requests>=2.30.0", # For callback URLs
+    "python-dotenv>=1.0.0", # For local .env file usage
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0"
+flake8 = "^6.0"
+# ruff = "^0.1" # Alternatively, use ruff
+moto = {extras = ["s3", "sqs", "sns", "textract", "sagemaker"], version = "^4.0.0"} # Added moto with extras
+pytest-mock = "^3.10.0" # Added pytest-mock
+requests-mock = "^1.9.3" # Added requests-mock
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

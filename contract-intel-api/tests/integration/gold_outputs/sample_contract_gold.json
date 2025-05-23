@@ -1,0 +1,69 @@
+{
+  "job_id": "mock_job_id",
+  "original_s3_uri": "s3://test-input-bucket/sample_contract.txt",
+  "document_type": "text",
+  "textract_job_id": "mock_textract_job_id",
+  "status": "COMPLETED_SIMULATED",
+  "sagemaker_output": {
+    "clause_extractions": [
+      {
+        "clause_type": "Payment Clause",
+        "text_span": [
+          10,
+          50
+        ],
+        "confidence": 0.95
+      },
+      {
+        "clause_type": "Termination Clause",
+        "text_span": [
+          100,
+          150
+        ],
+        "confidence": 0.88
+      }
+    ],
+    "risk_classifications": [
+      {
+        "risk_category": "High Risk",
+        "score": 0.78
+      },
+      {
+        "risk_category": "Compliance Issue",
+        "score": 0.65
+      }
+    ],
+    "summary": {
+      "summary": "This is a mock summary of the provided legal text. It highlights key aspects and obligations."
+    }
+  },
+  "extracted_clauses": [
+    {
+      "clause_type": "Payment Clause",
+      "text_span": [
+        10,
+        50
+      ],
+      "confidence": 0.95
+    },
+    {
+      "clause_type": "Termination Clause",
+      "text_span": [
+        100,
+        150
+      ],
+      "confidence": 0.88
+    }
+  ],
+  "risk_assessments": [
+    {
+      "risk_category": "High Risk",
+      "score": 0.78
+    },
+    {
+      "risk_category": "Compliance Issue",
+      "score": 0.65
+    }
+  ],
+  "summary": "This is a mock summary of the provided legal text. It highlights key aspects and obligations."
+}

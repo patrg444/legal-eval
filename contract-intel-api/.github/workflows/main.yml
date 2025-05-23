@@ -1,0 +1,139 @@
+name: Contract Intel API CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1 # Or your preferred region
+  ECR_REPOSITORY: contract-intel-sagemaker-models # Replace with your ECR repo name
+  # TF_VAR_sagemaker_model_image_uri will be set dynamically in the Terraform job
+
+jobs:
+  lint_and_test:
+    name: Lint & Test Python
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 1.5.1 # Specify a version or use 'latest'
+          virtualenvs-create: true
+          virtualenvs-in-project: true # Recommended for CI
+
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install dependencies
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-ansi # Installs dev dependencies too by default
+
+      - name: Run linters (Flake8)
+        run: |
+          poetry run flake8 src tests
+          # Or: poetry run ruff check src tests
+
+      - name: Run unit tests (Pytest)
+        run: |
+          poetry run pytest tests/
+          # Add options like --cov for coverage if needed
+
+  build_and_push_docker:
+    name: Build and Push Docker Image to ECR
+    runs-on: ubuntu-latest
+    needs: lint_and_test # Run only if lint_and_test passes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' # Only on push to main
+    outputs:
+      image_uri: ${{ steps.build-image.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4 # Use latest version
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2 # Use latest version
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }} # Use commit SHA as tag
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f contract-intel-api/Dockerfile ./contract-intel-api
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  terraform_cd:
+    name: Terraform Plan & Apply
+    runs-on: ubuntu-latest
+    needs: build_and_push_docker # Run after Docker image is built and pushed
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    env:
+      # Pass the Docker image URI from the build job to Terraform
+      # This assumes your Terraform variable is named 'sagemaker_model_image_uri'
+      TF_VAR_sagemaker_model_image_uri: ${{ needs.build_and_push_docker.outputs.image_uri }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3 # Use latest version
+        with:
+          terraform_version: 1.5.0 # Specify your Terraform version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ./contract-intel-api/infra
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: ./contract-intel-api/infra
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./contract-intel-api/infra
+        # For PRs, output plan. For pushes to main, also generate a plan.
+        run: terraform plan -no-color -out=tfplan
+        # For PRs, you might want to use actions to comment the plan on the PR
+        # e.g., using actions/github-script or specific Terraform PR comment actions
+
+      - name: Terraform Apply (for main branch)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: ./contract-intel-api/infra
+        run: terraform apply -auto-approve -input=false tfplan
+
+      # Example: Store plan artifact for PRs
+      - name: Upload Terraform Plan for PRs
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan
+          path: ./contract-intel-api/infra/tfplan

@@ -1,0 +1,9 @@
+This is a sample contract for testing purposes.
+
+Clause 1: The party of the first part (hereinafter "Party A") agrees to provide services to the party of the second part (hereinafter "Party B").
+
+Clause 2: Payment shall be made by Party B to Party A within 30 days of receipt of invoice.
+
+Clause 3: This agreement shall be governed by the laws of the State of Example.
+
+This contract is effective as of January 1, 2024.
